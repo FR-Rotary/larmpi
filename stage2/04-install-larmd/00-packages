@@ -1,0 +1,7 @@
+perl
+default-mysql-client
+libdevice-serialport-perl
+libdbi-perl
+libdbd-mysql-perl
+rsyslog
+neovim

@@ -1,0 +1,334 @@
+#!/usr/bin/perl
+
+# 2012-02-27, Daniel Vindevåg: First version. 
+# 2012-12-19, Daniel Vindevåg: Redirect all output to syslog,
+#                              removed debug option 
+# 2013-06-03, Daniel Vindevåg: Added log_and_die()
+# 2013-10-12, Daniel Vindevåg: Exits if another instance is running.
+#                              Handles connection loss to DB.
+# 2024-11-14, Daniel Vindevåg: Changes for new subnet. Code cleanup.
+# 2024-12-21, Daniel Vindevåg: Added status files in /run/larm
+# 2025-08-10, Erik Örtenberg:  Updated for new DB creds and RPI image
+
+
+use Device::SerialPort; 
+use DBI;
+use Sys::Syslog qw(:standard :macros);
+use POSIX qw(setsid strftime setuid setgid tzset);
+use strict;
+
+# Device filename
+my $port_name = "/dev/ttyACM0";
+
+#my $port_name = "/dev/larm";
+
+# Seconds until program quits if device disappear	
+my $port_ttl = 60*20;
+
+# setuid
+my $user = 1000;		# rockpullan
+my $group = 1000;		# rockpullan
+
+# Save pid to file, leave blank to ignore
+my $pidfile = "/run/larmd.pid";
+
+## Larm on/off file
+#  add the following to /etc/rc.local
+#    mkdir /run/larm
+#    chown 1001:1004 /run/larm
+my $larm_on_file  = "/run/larm/larm_on";
+my $larm_off_file = "/run/larm/larm_off";
+my $larm_undefined_file = "/run/larm/larm_undefined";
+
+# Database config, 
+# CLI: mysql -h 192.168.6.5 -u puben_http -prockpullan puben_http
+my $DBHOST = 
+my $DBNAME = 
+my $DBUSER = 
+my $DBPASS = 
+
+my $strftime_fmt = "%a %b %e %H:%M";
+
+# DB sql strings
+my $sql_insert = "INSERT INTO larmlog VALUES (null, %s, %d)";
+my $sql_select = "SELECT date_format(date, '%a %b %e %H:%i'), status FROM larmlog ORDER BY -date LIMIT 1";
+my $db_date_fmt = "%Y-%m-%d %H:%M:%S";
+
+## Device
+#
+# To use /dev/larm instead of /dev/ttyACM[n], 
+# the following udev rule must be applied
+#
+# ATTRS{idProduct}=="9135", ATTRS{idVendor}=="0403", SYMLINK+="larm", MODE="0666"
+
+## Database layout 
+#
+# CREATE TABLE larmlog (id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT, date TIMESTAMP NULL, status TINYINT, PRIMARY KEY(id));
+# INSERT INTO larmlog values (null, now(), 1);
+# SELECT id, date, status FROM larmlog ORDER BY -date LIMIT 1;
+
+## Dependencies
+#
+# apt-get install libdevice-serialport-perl libdbi-perl libdbd-mysql-perl
+
+
+# Global variables
+my $larm;			# serial port
+my $check_count = 0;  		# Counter for checking for device is connected
+
+
+# Set time zone
+#$ENV{TZ} = 'Europe/Stockholm';
+#tzset;
+
+
+# Signal handlers
+
+$SIG{INT} = sub {
+    syslog(LOG_INFO, "SIGINT exiting!");
+    undef $larm;
+    closelog();
+    unlink $pidfile;
+    unlink $larm_off_file;
+    unlink $larm_on_file;
+    open(DATA,">$larm_undefined_file");
+    close(DATA);
+    die;
+};
+
+$SIG{TERM} = sub {
+    syslog(LOG_INFO, "SIGTERM exiting!");
+    undef $larm;
+    closelog();
+    unlink $pidfile;
+    unlink $larm_off_file;
+    unlink $larm_on_file;
+    open(DATA,">$larm_undefined_file");
+    close(DATA);
+    die;
+};
+
+$SIG{HUP} = sub {
+    syslog(LOG_INFO, "SIGHUP reloading!");
+    undef $larm;
+    unlink $larm_off_file;
+    unlink $larm_on_file;
+    open_port();
+};
+
+
+
+# functions
+sub open_port();
+sub check_port();
+sub db_add;
+
+sub log_and_die {
+	syslog(LOG_INFO, $_[0]);
+	closelog();
+	#die $_[0];
+	print $_[0] . "\n";
+	exit -1;
+}
+
+
+
+## Start
+
+openlog("larmd", "ndelay,pid", "local0");
+if (-e $pidfile && !system("ps `cat $pidfile` >/dev/null")) {
+	log_and_die "Another instance of larmd is currently running, exiting!";
+}
+syslog(LOG_INFO, "Program starting");
+chdir "/" or log_and_die("Can’t chdir to /: $!");
+defined(my $pid = fork) or log_and_die("Can’t fork: $!");
+if ($pid) {
+	syslog(LOG_INFO, "Larm deamonized as $pid");
+	if ($pidfile) {
+	    open PIDFILE, ">", $pidfile or log_and_die($!);
+	    print PIDFILE "$pid\n";
+	    close PIDFILE;
+	    chown $user, $group, $pidfile
+	}
+	closelog();
+	exit;
+}
+setsid() or log_and_die("Can’t start a new session: $!");
+umask 0;
+open STDIN, "/dev/null" or log_and_die("Can’t read /dev/null: $!");
+open STDOUT, ">>/dev/null" or log_and_die("Can’t write to /dev/null: $!");
+open STDERR, ">>/dev/null" or log_and_die("Can’t write to /dev/null: $!");
+syslog(LOG_INFO, "Running as deamon");
+if ($user) { setuid($user); }
+if ($group) { setgid($group); }
+
+unlink $larm_off_file;
+unlink $larm_on_file;
+
+
+sleep 30;
+
+check_port();
+if (not defined $larm) { open_port(); }
+
+
+# Main loop
+#
+while (1) {
+	my $larm_status;
+	my $result;
+
+	if ( $check_count++ == 5) { 	# Check port every 5s
+		check_port();
+		$check_count = 0;
+	}
+	sleep(1);
+	$result = $larm->input;
+
+	if ($result =~ "OFF") {
+		$larm_status = 0;
+		$result = "";
+		my $time = strftime($strftime_fmt, localtime);
+		syslog(LOG_INFO, "Hardware: Larm OFF");
+		my ($db_time, $db_status) = db_add($larm_status);
+	}
+
+	if ($result =~ "ON") {
+		$larm_status = 1;
+		$result = "";
+		my $time = strftime($strftime_fmt, localtime);
+		syslog(LOG_INFO, "Hardware: Larm ON");
+		my ($db_time, $db_status) = db_add($larm_status);
+	}
+
+	if ($result =~ "DFU") {
+		$result =~ s/\r//g;
+		$result =~ s/\n//g;
+		syslog(LOG_INFO, $result);
+		sleep(1);
+		check_port();
+	}
+
+}
+
+## end
+
+
+
+# Add entry to database, return last entry.
+#
+sub db_add {
+	my $status = shift(@_);
+	my $db = DBI->connect("DBI:mysql:$DBNAME:$DBHOST", $DBUSER, $DBPASS, { PrintError => 0, RaiseError => 0 });
+    	if (!$db) { 
+	    syslog(LOG_INFO, "Database error");
+	    my $time = strftime($db_date_fmt, localtime());
+            syslog(LOG_INFO, sprintf($sql_insert, "'" . $time . "'" , $status). ";");
+	    undef $db; 
+	    return (-1, -1); 
+	}
+	$DBI::result = $db->prepare($sql_select);
+	$DBI::result->execute();
+	my ($db_time, $db_status) = $DBI::result->fetchrow_array;
+	$DBI::result->finish();
+	if ($status != $db_status) {
+		$DBI::result = $db->prepare(sprintf($sql_insert, "now()", $status));
+		$DBI::result->execute();
+		$DBI::result->finish();
+	}
+	$db->disconnect;
+	undef $db;
+	if ($status) {
+	    unlink $larm_undefined_file;
+	    #`rm -f $larm_off_file`;
+	    unlink $larm_off_file;
+	    #`touch $larm_on_file`;
+	    open(DATA,">$larm_on_file");
+	    close(DATA);
+	} else {
+	    unlink $larm_undefined_file;
+	    #`rm -f $larm_on_file`;
+	    unlink $larm_on_file;
+	    #`touch $larm_off_file`;
+	    open(DATA,">$larm_off_file");
+	    close(DATA);
+	}
+	return ($db_time, $db_status)
+}
+
+
+
+# Check if serial port exists, open or wait until it reappears
+#
+sub check_port () {
+    if ( ! (-e $port_name)) {
+	syslog(LOG_INFO, "Port disappeared");
+	if (defined $larm) { undef $larm; }
+	my $ttl_count = $port_ttl;
+	my ($db_time, $db_status) = db_add(-1);
+
+	while ($ttl_count and !(-e $port_name)) {
+	    sleep 1;
+	    if (-e $port_name) {
+		syslog(LOG_INFO, "Port reappered");
+		open_port();
+	    }
+	    $ttl_count--;
+	}
+    }
+    if ( !(-e $port_name)) {
+	syslog(LOG_INFO, "Port gone to long exiting!");
+	exit (-1);
+    }
+}
+
+
+
+# Open serial port
+#
+sub open_port() {
+	my $status;
+	my $result;
+	sleep 1;
+	$larm = new Device::SerialPort($port_name);
+	if ( !$larm ) {
+		syslog(LOG_INFO, "Port not accessible, aborting open_port()");
+		return;
+	}
+	$larm->baudrate(115200);
+	$larm->parity("none");
+	$larm->databits(8);
+	$larm->stopbits(1);
+	$larm->handshake("none");
+	if (readlink($port_name)) {
+		syslog(LOG_INFO, "Port: " . $port_name . " (" . readlink($port_name) . ") opened");
+	} else {
+		syslog(LOG_INFO, "Port: $port_name opened");
+	}
+
+	$larm->write("atv\r\n");
+	sleep 1;
+	$result = $larm->input;
+	if ($result) {
+		syslog(LOG_INFO, "Version: " . int($result) . 
+			" (" . strftime("%Y%m%d %H:%M:%S", localtime(int($result))) . ")");
+	}
+
+	$larm->write("atstatus\r\n");
+	my $time = strftime($strftime_fmt, localtime());
+	sleep 1;
+	$result = $larm->input;
+	if ($result =~ "OFF") { $status = 0; }
+	if ($result =~ "ON")  { $status = 1; }
+
+	my ($db_time, $db_status) = db_add($status);
+	if ($db_time >= 0) {
+		syslog(LOG_INFO, "Database status: $db_time: $db_status");
+	}
+
+	if ($status) {
+		syslog(LOG_INFO, "Hardware: Larm ON"); 
+	} else {
+		syslog(LOG_INFO, "Hardware: Larm OFF");
+	}
+} 
